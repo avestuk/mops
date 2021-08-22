@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -13,8 +12,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	serializerYaml "k8s.io/apimachinery/pkg/runtime/serializer/yaml"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/restmapper"
 )
 
@@ -120,18 +120,16 @@ func TestGetSeldonDeployment(t *testing.T) {
 }
 
 func TestWatchSeldonDeployment(t *testing.T) {
-	config, err := buildConfig()
-	require.NoError(t, err, "failed to build config")
-
 	// Build typed client
-	client, err := typedClientInit(config)
+	client, dclient, err := buildK8sClients()
 	require.NoError(t, err, "failed to build client")
 
 	// Watch SeldonDeployment
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	watcher, err := client.EventsV1beta1().Events("default").Watch(ctx, metav1.ListOptions{})
+	watcher, err := getEvents(ctx, client, "default")
 	require.NoError(t, err, "failed to get seldondeployment")
+	defer watcher.Stop()
 
 	go func() {
 		results := watcher.ResultChan()
@@ -139,20 +137,22 @@ func TestWatchSeldonDeployment(t *testing.T) {
 			switch ev.Type {
 			case watch.Added, watch.Modified, watch.Deleted:
 				event := ev.Object.(*eventsv1beta1.Event)
-
-				t.Logf("\naction: %s\n reason: %s\n note: %s\n object: %s\n", event.Action, event.Reason, event.Note, event.Regarding.Kind)
+				if event.Regarding.APIVersion == mlSeldonAPIVersion {
+					t.Logf("\nnote: %s\n", event.Note)
+				}
 			case watch.Error:
 				t.Logf("watcher returned an error: %s", ev.Object)
 			}
 		}
-
 		t.Logf("channel closed")
 	}()
 
-	time.Sleep(10 * time.Second)
+	// Create a Seldon Deployment
+	obj := createSeldonDeployment(t, seldonModel, client, dclient)
 
-	watcher.Stop()
-
+	// Wait for the deployment to be ready
+	_, err = waitForDeploymentReady(client, obj.GetNamespace())
+	require.NoError(t, err, "deployment failed to get ready")
 }
 
 func TestDecode(t *testing.T) {
@@ -337,6 +337,9 @@ func TestUpdate(t *testing.T) {
 			// Establish a REST mapping for the GVR. For instance
 			// for a Pod the endpoint we need is: GET /apis/v1/namespaces/{namespace}/pods/{name}
 			// As some objects are not namespaced (e.g. PVs) a namespace may not be required.
+			if obj.GetNamespace() == "" {
+				obj.SetNamespace("default")
+			}
 			dr := getRESTMapping(dynamicClient, gvr.Scope.Name(), obj.GetNamespace(), gvr.Resource)
 
 			// Marshall our runtime object into json. All json is
@@ -346,13 +349,13 @@ func TestUpdate(t *testing.T) {
 			require.NoError(t, err, "failed to marshal json to runtime obj")
 
 			// Attempt to ServerSideApply the provided object.
-			defer func() {
+			defer func(obj *unstructured.Unstructured) {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				dr.Delete(ctx, obj.GetName(), *metav1.NewDeleteOptions(0))
-			}()
+			}(obj)
 
-			_, err = applyObjects(dr, obj, data)
+			k8sObj, err := applyObjects(dr, obj, data)
 			require.NoError(t, err, "failed to patch object, test: %s", tt.Name)
 
 			// Wait for the resource to be available
@@ -360,60 +363,82 @@ func TestUpdate(t *testing.T) {
 			_, err = waitForDeploymentReady(client, obj.GetNamespace())
 			require.NoError(t, err, "deployment failed to get ready")
 
-			// Get SeldonDeployment
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			k8sObj, err := dr.Get(ctx, obj.GetName(), metav1.GetOptions{})
-			require.NoError(t, err, "failed to get seldondeployment")
-
-			// Get predictors field.
-			// Predictors is a []map[string]interface{} so we have to do a little magic to access the replicas field.
-			predictors, found, err := unstructured.NestedSlice(k8sObj.UnstructuredContent(), "spec", "predictors")
-			require.NoError(t, err, "failed to get field")
-			require.True(t, found, "field predictors not found")
-			t.Logf("predictors: %s", predictors)
-
-			// Cast the first element of the predictors slice to map[string]interface{}
-			replicas, found, err := unstructured.NestedInt64(predictors[0].(map[string]interface{}), "replicas")
-			require.NoError(t, err, "failed to get field")
-			require.True(t, found, "field predictors not found")
-			require.Equal(t, 1, replicas)
-			t.Logf("replicas: %d", replicas)
-
+			// Get replica count
+			replicas, err := getReplicas(k8sObj)
+			require.NoError(t, err, "failed to get replicas")
 			replicas += 1
 
-			// Create a patch
-			patchInterface := []interface{}{
-				map[string]interface{}{
-					"op":    "replace",
-					"path":  "/spec/predictors/replicas",
-					"value": replicas,
-				},
-			}
+			k8sObj, err = updateReplicas(dr, k8sObj)
+			require.NoError(t, err, "failed to update replica count")
 
-			patchJson, err := json.Marshal(patchInterface)
-			require.NoError(t, err, "failed to marshall patch to json")
-
-			obj, err = dr.Patch(ctx, obj.GetName(), types.JSONPatchType, patchJson, metav1.PatchOptions{})
-			require.NoError(t, err, "failed to patch SeldonDeployment")
-
-			// Get predictors field.
-			// Predictors is a []map[string]interface{} so we have to do a little magic to access the replicas field.
-			predictors, found, err = unstructured.NestedSlice(k8sObj.UnstructuredContent(), "spec", "predictors")
-			require.NoError(t, err, "failed to get field")
-			require.True(t, found, "field predictors not found")
-			t.Logf("predictors: %s", predictors)
-
-			// Cast the first element of the predictors slice to map[string]interface{}
-			replicas, found, err = unstructured.NestedInt64(predictors[0].(map[string]interface{}), "replicas")
-			require.NoError(t, err, "failed to get field")
-			require.True(t, found, "field predictors not found")
-			require.Equal(t, 2, replicas)
+			replicas, err = getReplicas(k8sObj)
+			require.NoError(t, err, "failed to get replica from k8s object")
+			require.Equal(t, int64(2), replicas)
 
 			// Wait for the resource to be available
 			// Easiest way to do this is to find the deployment that was created and watch that.
-			_, err = waitForDeploymentReady(client, obj.GetNamespace())
+			deployment, err := waitForDeploymentReady(client, obj.GetNamespace())
 			require.NoError(t, err, "deployment failed to get ready")
+			require.Equal(t, 2, deployment.Spec.Replicas, "expected deployment to have two replicas set")
 		}
 	}
+}
+
+func createSeldonDeployment(t *testing.T, inputManifest string, client kubernetes.Interface, dynamicClient dynamic.Interface) *unstructured.Unstructured {
+	// Return GroupMappings for K8s API resources.
+	gr, err := restmapper.GetAPIGroupResources(client.Discovery())
+	require.NoError(t, err, "failed to get API group resources")
+	mapper := restmapper.NewDiscoveryRESTMapper(gr)
+
+	// Build decoder
+	objects, err := decodeInput([]byte(inputManifest))
+	require.NoError(t, err, "failed to decode test input")
+	object := objects[0]
+
+	// Create a serializer that can decode
+	decodingSerializer := serializerYaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
+
+	obj := &unstructured.Unstructured{}
+
+	// Decode the object into a k8s runtime Object. This also
+	// returns the GroupValueKind for the object. GVK identifies a
+	// kind. A kind is the implementation of a K8s API resource.
+	// For instance, a pod is a resource and it's v1/Pod
+	// implementation is its kind.
+	runtimeObj, gvk, err := decodeRawObjects(decodingSerializer, object.Raw, obj)
+	require.NoError(t, err, "failed to decode object")
+
+	// Find the resource mapping for the GVK extracted from the
+	// object. A resource type is uniquely identified by a Group,
+	// Version, Resource tuple where a kind is identified by a
+	// Group, Version, Kind tuple. You can see these mappings using
+	// kubectl api-resources.
+	gvr, err := getResourceMapping(mapper, gvk)
+	require.NoError(t, err, "failed to get GroupVersionResource from GroupVersionKind")
+
+	// Establish a REST mapping for the GVR. For instance
+	// for a Pod the endpoint we need is: GET /apis/v1/namespaces/{namespace}/pods/{name}
+	// As some objects are not namespaced (e.g. PVs) a namespace may not be required.
+	if obj.GetNamespace() == "" {
+		obj.SetNamespace("default")
+	}
+	dr := getRESTMapping(dynamicClient, gvr.Scope.Name(), obj.GetNamespace(), gvr.Resource)
+
+	// Marshall our runtime object into json. All json is
+	// valid yaml but not all yaml is valid json. The
+	// APIServer works on json.
+	data, err := marshallRuntimeObj(runtimeObj)
+	require.NoError(t, err, "failed to marshal json to runtime obj")
+
+	// Attempt to ServerSideApply the provided object.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		dr.Delete(ctx, obj.GetName(), *metav1.NewDeleteOptions(0))
+	})
+
+	k8sObj, err := applyObjects(dr, obj, data)
+	require.NoError(t, err, "failed to apply objects")
+
+	return k8sObj
 }

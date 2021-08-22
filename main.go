@@ -11,6 +11,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/apps/v1"
+	eventsv1beta1 "k8s.io/api/events/v1beta1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -38,6 +39,10 @@ const (
 	// Durations
 	defaultTimeout time.Duration = 10 * time.Second
 	pollTimeout    time.Duration = time.Minute
+
+	// Output
+	colourGreen string = "\033[32m"
+	colourReset string = "\033[0m"
 )
 
 // TODO
@@ -145,6 +150,9 @@ func main() {
 		// Establish a REST mapping for the GVR. For instance
 		// for a Pod the endpoint we need is: GET /apis/v1/namespaces/{namespace}/pods/{name}
 		// As some objects are not namespaced (e.g. PVs) a namespace may not be required.
+		if obj.GetNamespace() == "" {
+			obj.SetNamespace("default")
+		}
 		dr := getRESTMapping(dynamicClient, gvr.Scope.Name(), obj.GetNamespace(), gvr.Resource)
 
 		// Marshall our runtime object into json. All json is
@@ -155,15 +163,69 @@ func main() {
 			exitWithError(fmt.Sprintf("failed to marshal json to runtime obj, got err: %s", err))
 		}
 
+		// Create an event watcher
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		watcher, err := getEvents(ctx, client, obj.GetNamespace())
+		if err != nil {
+			exitWithError(fmt.Sprintf("failed to create event watcher, got err: %s", err))
+		}
+
+		go func() {
+			results := watcher.ResultChan()
+			for ev := range results {
+				switch ev.Type {
+				case watch.Added, watch.Modified, watch.Deleted:
+					event := ev.Object.(*eventsv1beta1.Event)
+					if event.Regarding.APIVersion == mlSeldonAPIVersion {
+						fmt.Printf("\n%s: %s\n", time.Now(), event.Note)
+					}
+				case watch.Error:
+					fmt.Printf("event watcher watcher returned an error: %s", ev.Object)
+				}
+			}
+		}()
+
 		// Attempt to ServerSideApply the provided object.
 		k8sObj, err := applyObjects(dr, obj, data)
 		if err != nil {
 			exitWithError(fmt.Sprintf("failed to apply obj, got err: %s", err))
 		}
+		// Defer deleting the parsed object so we always ensure cleanup.
+		defer func(obj *unstructured.Unstructured) {
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+			defer cancel()
+			fmt.Printf("\n%sMOPS: attempting cleanup%s", colourGreen, colourReset)
+			err = dr.Delete(ctx, obj.GetName(), *metav1.NewDeleteOptions(0))
+			if err != nil {
+				exitWithError(fmt.Sprintf("failed to cleanup resources, got err: %s", err))
+			}
+			fmt.Printf("\n%sMOPS: resource %s %s/%s cleaned up%s\n", colourGreen, gvk.Group, obj.GetNamespace(), obj.GetName(), colourReset)
+		}(obj)
 
-		fmt.Printf("\n%s %s/%s updated\n", k8sObj.GetKind(), k8sObj.GetNamespace(), k8sObj.GetName())
+		fmt.Printf("\n%sMOPS: %s %s %s/%s updated\n%s", colourGreen, time.Now(), gvk.Group, k8sObj.GetNamespace(), k8sObj.GetName(), colourReset)
+
+		// Wait for the deployment to be ready
+		_, err = waitForDeploymentReady(client, obj.GetNamespace())
+		if err != nil {
+			exitWithError(fmt.Sprintf("failed to wait for deployment ready, got err: %s", err))
+		}
+
+		// Update the replica count
+		fmt.Printf("\n%sMOPS: updating replica count for %s %s/%s %s", colourGreen, gvk.Group, k8sObj.GetNamespace(), k8sObj.GetName(), colourReset)
+		k8sObj, err = updateReplicas(dr, k8sObj)
+		if err != nil {
+			exitWithError(fmt.Sprintf("failed to update replica count, got err: %s", err))
+		}
+
+		fmt.Printf("\n%sMOPS: %s %s %s/%s updated\n%s", colourGreen, time.Now(), gvk.Group, k8sObj.GetNamespace(), k8sObj.GetName(), colourReset)
+
+		// Wait for the deployment to be ready
+		_, err = waitForDeploymentReady(client, obj.GetNamespace())
+		if err != nil {
+			exitWithError(fmt.Sprintf("failed to wait for deployment ready, got err: %s", err))
+		}
 	}
-
 }
 
 func buildConfig() (*rest.Config, error) {
@@ -229,18 +291,6 @@ func getRESTMapping(dynamicClient dynamic.Interface, name meta.RESTScopeName, na
 	return dr
 }
 
-func buildWatcher(client kubernetes.Interface) (watch.Interface, error) {
-	// Watch SeldonDeployment
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	watcher, err := client.EventsV1beta1().Events("default").Watch(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	return watcher, nil
-}
-
 func decodeInput(fileContents []byte) ([]*runtime.RawExtension, error) {
 	y := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(fileContents), 4096)
 	objects := []*runtime.RawExtension{}
@@ -282,6 +332,60 @@ func applyObjects(dr dynamic.ResourceInterface, obj *unstructured.Unstructured, 
 	return dr.Patch(ctx, obj.GetName(), types.ApplyPatchType, data, metav1.PatchOptions{
 		FieldManager: FieldManager,
 	})
+}
+
+// updateReplicas increases the replica count for a SeldonDeployment by one.
+func updateReplicas(dr dynamic.ResourceInterface, k8sObj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	// Get replica count
+	replicas, err := getReplicas(k8sObj)
+	if err != nil {
+		return nil, fmt.Errorf("%w", err)
+	}
+
+	// Bump replica count
+	replicas += 1
+
+	// Create a patch
+	patchInterface := []interface{}{
+		map[string]interface{}{
+			"op":    "replace",
+			"path":  "/spec/predictors/0/replicas",
+			"value": replicas,
+		},
+	}
+
+	// Marshall the patch to json
+	patchJson, err := json.Marshal(patchInterface)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshall patch to json, got err: %w", err)
+	}
+
+	// Apply the patch to bump the replica count.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	k8sObj, err = dr.Patch(ctx, k8sObj.GetName(), types.JSONPatchType, patchJson, metav1.PatchOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to patch %s %s/%s", k8sObj.GetAPIVersion(), k8sObj.GetNamespace(), k8sObj.GetName())
+	}
+
+	return k8sObj, nil
+}
+
+func getReplicas(k8sObj *unstructured.Unstructured) (int64, error) {
+	// Get predictors field.
+	// Predictors is a []map[string]interface{} so we have to do a little magic to access the replicas field.
+	predictors, found, err := unstructured.NestedSlice(k8sObj.UnstructuredContent(), "spec", "predictors")
+	if err != nil || !found {
+		return 0, fmt.Errorf("spec.predictors field was not found for object: %s/%s, presence: %t, got err: %w", k8sObj.GetNamespace(), k8sObj.GetName(), found, err)
+	}
+
+	// Cast the first element of the predictors slice to map[string]interface{}
+	replicas, found, err := unstructured.NestedInt64(predictors[0].(map[string]interface{}), "replicas")
+	if err != nil || !found {
+		return 0, fmt.Errorf("spec.predictors[0].replicas field was not found for object: %s/%s, presence: %t, got err: %w", k8sObj.GetNamespace(), k8sObj.GetName(), found, err)
+	}
+
+	return replicas, nil
 }
 
 func exitWithError(message string) {
@@ -329,11 +433,23 @@ func waitForDeploymentReady(client kubernetes.Interface, namespace string) (*v1.
 			continue
 		}
 
-		if seldonDeployment.Status.ReadyReplicas == *seldonDeployment.Spec.Replicas {
-			fmt.Printf("\n took: %s for deployment ready", time.Since(start))
+		// Spec.Replicas can be nil causing a panic so just protect against it.
+		if seldonDeployment.Spec.Replicas != nil && seldonDeployment.Status.ReadyReplicas == *seldonDeployment.Spec.Replicas {
+			fmt.Printf("\n%sMOPS: took: %s for deployment ready%s", colourGreen, time.Since(start), colourReset)
 			return seldonDeployment, nil
 		}
 	}
 
 	return nil, fmt.Errorf("timed out waiting for deployment: %s/%s to have %d ready pods", seldonDeployment.Namespace, seldonDeployment.Name, *seldonDeployment.Spec.Replicas)
+}
+
+// getEvents returns function for logging events, a function to close the events channel and an error.
+func getEvents(ctx context.Context, client kubernetes.Interface, namespace string) (watch.Interface, error) {
+	// Watch SeldonDeployment
+	watcher, err := client.EventsV1beta1().Events(namespace).Watch(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create event watcher")
+	}
+
+	return watcher, nil
 }
