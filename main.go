@@ -34,6 +34,7 @@ const (
 	mlSeldon           string = "machinelearning.seldon.io"
 	mlSeldonVersion    string = "v1"
 	mlSeldonAPIVersion string = mlSeldon + "/" + mlSeldonVersion
+	mlSeldonKind       string = "SeldonDeployment"
 
 	// Durations
 	defaultTimeout time.Duration = 10 * time.Second
@@ -43,6 +44,12 @@ const (
 	colourGreen string = "\033[32m"
 	colourReset string = "\033[0m"
 )
+
+var seldonGVK = schema.GroupVersionKind{
+	Group:   mlSeldon,
+	Version: mlSeldonVersion,
+	Kind:    mlSeldonKind,
+}
 
 // Create a standalone program in Go which takes in a Seldon Core Custom Resource and creates it over the Kubernetes API
 // Watch the created resource to wait for it to become available.
@@ -287,8 +294,18 @@ func decodeInput(fileContents []byte) ([]*runtime.RawExtension, error) {
 }
 
 // decodeRawObjects returns a runtime object, and the GVK for that object.
+// Validates that the object is of group machinelearning.seldon.io
 func decodeRawObjects(decoder runtime.Serializer, data []byte, into *unstructured.Unstructured) (runtime.Object, *schema.GroupVersionKind, error) {
-	return decoder.Decode(data, nil, into)
+	obj, gvk, err := decoder.Decode(data, nil, into)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if *gvk != seldonGVK {
+		return nil, nil, fmt.Errorf("input was not of group %s", mlSeldon)
+	}
+
+	return obj, gvk, nil
 }
 
 // getResourceMapping returns the resource that maps to a GroupKind.
