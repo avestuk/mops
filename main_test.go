@@ -18,6 +18,12 @@ import (
 	"k8s.io/client-go/restmapper"
 )
 
+// Validate Kind
+var gk = schema.GroupKind{
+	Group: "machinelearning.seldon.io",
+	Kind:  "SeldonDeployment",
+}
+
 var seldonModel = `
 apiVersion: machinelearning.seldon.io/v1
 kind: SeldonDeployment
@@ -148,7 +154,7 @@ func TestWatchSeldonDeployment(t *testing.T) {
 	}()
 
 	// Create a Seldon Deployment
-	obj := createSeldonDeployment(t, seldonModel, client, dclient)
+	obj, _ := createSeldonDeployment(t, seldonModel, client, dclient)
 
 	// Wait for the deployment to be ready
 	_, err = waitForDeploymentReady(client, obj.GetNamespace())
@@ -175,29 +181,6 @@ func TestDecode(t *testing.T) {
 		gvk := runtimeObj.GetObjectKind().GroupVersionKind()
 		require.NotNil(t, gvk)
 	}
-}
-
-func TestBuildClients(t *testing.T) {
-	client, dClient, err := buildK8sClients()
-	require.NoError(t, err, "failed to build k8s clients")
-
-	// Get pods from kube-system to prove client works
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	pods, err := client.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{})
-	require.NoError(t, err, "failed to get pods")
-	require.Greater(t, len(pods.Items), 1, "expected kube-system to return more than 1 pod")
-
-	// Get pods from kube-system to prove the dynamic client works
-	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	dpods, err := dClient.Resource(schema.GroupVersionResource{
-		Group:    "",
-		Version:  "v1",
-		Resource: "pods",
-	}).Namespace("kube-system").List(ctx, metav1.ListOptions{})
-	require.NoError(t, err, "failed to get pods")
-	require.Greater(t, len(dpods.Items), 1, "expected kube-system to return more than 1 pod")
 }
 
 func TestApply(t *testing.T) {
@@ -303,88 +286,35 @@ func TestUpdate(t *testing.T) {
 		client, dynamicClient, err := buildK8sClients()
 		require.NoError(t, err, "failed to build client")
 
-		// Return GroupMappings for K8s API resources.
-		gr, err := restmapper.GetAPIGroupResources(client.Discovery())
-		require.NoError(t, err, "failed to get API group resources")
-		mapper := restmapper.NewDiscoveryRESTMapper(gr)
+		// Create a seldon deployment
+		k8sObj, dr := createSeldonDeployment(t, tt.Input, client, dynamicClient)
 
-		// Build decoder
-		objects, err := decodeInput([]byte(tt.Input))
-		require.NoError(t, err, "failed to decode test input, %s", tt.Name)
+		// Wait for the resource to be available
+		// Easiest way to do this is to find the deployment that was created and watch that.
+		_, err = waitForDeploymentReady(client, k8sObj.GetNamespace())
+		require.NoError(t, err, "deployment failed to get ready")
 
-		// Create a serializer that can decode
-		decodingSerializer := serializerYaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
+		// Get replica count
+		replicas, err := getReplicas(k8sObj)
+		require.NoError(t, err, "failed to get replicas")
+		replicas += 1
 
-		for _, object := range objects {
-			obj := &unstructured.Unstructured{}
+		k8sObj, err = updateReplicas(dr, k8sObj)
+		require.NoError(t, err, "failed to update replica count")
 
-			// Decode the object into a k8s runtime Object. This also
-			// returns the GroupValueKind for the object. GVK identifies a
-			// kind. A kind is the implementation of a K8s API resource.
-			// For instance, a pod is a resource and it's v1/Pod
-			// implementation is its kind.
-			runtimeObj, gvk, err := decodeRawObjects(decodingSerializer, object.Raw, obj)
-			require.NoError(t, err, "failed to decode object")
+		replicas, err = getReplicas(k8sObj)
+		require.NoError(t, err, "failed to get replica from k8s object")
+		require.Equal(t, int64(2), replicas)
 
-			// Find the resource mapping for the GVK extracted from the
-			// object. A resource type is uniquely identified by a Group,
-			// Version, Resource tuple where a kind is identified by a
-			// Group, Version, Kind tuple. You can see these mappings using
-			// kubectl api-resources.
-			gvr, err := getResourceMapping(mapper, gvk)
-			require.NoError(t, err, "failed to get GroupVersionResource from GroupVersionKind")
-
-			// Establish a REST mapping for the GVR. For instance
-			// for a Pod the endpoint we need is: GET /apis/v1/namespaces/{namespace}/pods/{name}
-			// As some objects are not namespaced (e.g. PVs) a namespace may not be required.
-			if obj.GetNamespace() == "" {
-				obj.SetNamespace("default")
-			}
-			dr := getRESTMapping(dynamicClient, gvr.Scope.Name(), obj.GetNamespace(), gvr.Resource)
-
-			// Marshall our runtime object into json. All json is
-			// valid yaml but not all yaml is valid json. The
-			// APIServer works on json.
-			data, err := marshallRuntimeObj(runtimeObj)
-			require.NoError(t, err, "failed to marshal json to runtime obj")
-
-			// Attempt to ServerSideApply the provided object.
-			defer func(obj *unstructured.Unstructured) {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				dr.Delete(ctx, obj.GetName(), *metav1.NewDeleteOptions(0))
-			}(obj)
-
-			k8sObj, err := applyObjects(dr, obj, data)
-			require.NoError(t, err, "failed to patch object, test: %s", tt.Name)
-
-			// Wait for the resource to be available
-			// Easiest way to do this is to find the deployment that was created and watch that.
-			_, err = waitForDeploymentReady(client, obj.GetNamespace())
-			require.NoError(t, err, "deployment failed to get ready")
-
-			// Get replica count
-			replicas, err := getReplicas(k8sObj)
-			require.NoError(t, err, "failed to get replicas")
-			replicas += 1
-
-			k8sObj, err = updateReplicas(dr, k8sObj)
-			require.NoError(t, err, "failed to update replica count")
-
-			replicas, err = getReplicas(k8sObj)
-			require.NoError(t, err, "failed to get replica from k8s object")
-			require.Equal(t, int64(2), replicas)
-
-			// Wait for the resource to be available
-			// Easiest way to do this is to find the deployment that was created and watch that.
-			deployment, err := waitForDeploymentReady(client, obj.GetNamespace())
-			require.NoError(t, err, "deployment failed to get ready")
-			require.Equal(t, 2, deployment.Spec.Replicas, "expected deployment to have two replicas set")
-		}
+		// Wait for the resource to be available
+		// Easiest way to do this is to find the deployment that was created and watch that.
+		deployment, err := waitForDeploymentReady(client, k8sObj.GetNamespace())
+		require.NoError(t, err, "deployment failed to get ready")
+		require.Equal(t, int32(2), *deployment.Spec.Replicas, "expected deployment to have two replicas set")
 	}
 }
 
-func createSeldonDeployment(t *testing.T, inputManifest string, client kubernetes.Interface, dynamicClient dynamic.Interface) *unstructured.Unstructured {
+func createSeldonDeployment(t *testing.T, inputManifest string, client kubernetes.Interface, dynamicClient dynamic.Interface) (*unstructured.Unstructured, dynamic.ResourceInterface) {
 	// Return GroupMappings for K8s API resources.
 	gr, err := restmapper.GetAPIGroupResources(client.Discovery())
 	require.NoError(t, err, "failed to get API group resources")
@@ -440,5 +370,5 @@ func createSeldonDeployment(t *testing.T, inputManifest string, client kubernete
 	k8sObj, err := applyObjects(dr, obj, data)
 	require.NoError(t, err, "failed to apply objects")
 
-	return k8sObj
+	return k8sObj, dr
 }

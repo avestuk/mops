@@ -29,11 +29,10 @@ import (
 )
 
 const (
-	FieldManager    string = "mops"
-	mlSeldon        string = "machinelearning.seldon.io"
-	mlSeldonVersion string = "v1"
-	//TODO
-	//mlSeldonResource   string = "SeldonDeployments"
+	// K8s consts
+	FieldManager       string = "mops"
+	mlSeldon           string = "machinelearning.seldon.io"
+	mlSeldonVersion    string = "v1"
 	mlSeldonAPIVersion string = mlSeldon + "/" + mlSeldonVersion
 
 	// Durations
@@ -45,26 +44,11 @@ const (
 	colourReset string = "\033[0m"
 )
 
-// TODO
-//var mlResource = schema.GroupVersionResource{
-//	Group:    mlSeldon,
-//	Version:  mlSeldonVersion,
-//	Resource: "SeldonDeployment",
-//	//Resource: "seldondeployments" - I think this is actually correct
-//}
-
-// TODO - Validate Kind
-var gk = schema.GroupKind{
-	Group: "machinelearning.seldon.io",
-	Kind:  "SeldonDeployment",
-}
-
-// * Create a standalone program in Go which takes in a Seldon Core Custom Resource and creates it over the Kubernetes API
-// * Watch the created resource to wait for it to become available.
-// * Scale the resource to 2 replicas.
-// * When it is available delete the Custom Resource.
-// * In parallel to the last 3 steps list the Kubernetes Events with descriptions emitted by the created custom resource until it is deleted.
-
+// Create a standalone program in Go which takes in a Seldon Core Custom Resource and creates it over the Kubernetes API
+// Watch the created resource to wait for it to become available.
+// Scale the resource to 2 replicas.
+// When it is available delete the Custom Resource.
+// In parallel to the last 3 steps list the Kubernetes Events with descriptions emitted by the created custom resource until it is deleted.
 func main() {
 	// setup input argument parsing
 	var file string
@@ -92,21 +76,10 @@ func main() {
 		exitWithError(fmt.Sprintf("failed to decode input, got err: %s", err))
 	}
 
-	// Create a config
-	config, err := buildConfig()
-	if err != nil {
-		exitWithError(fmt.Sprintf("failed to build client config, got err: %s", err))
-	}
-
 	// Create a typed and dynamic client
-	client, err := typedClientInit(config)
+	client, dynamicClient, err := buildK8sClients()
 	if err != nil {
 		exitWithError(fmt.Sprintf("failed to build typed client, got err: %s", err))
-	}
-
-	dynamicClient, err := dynamicClientInit(config)
-	if err != nil {
-		exitWithError(fmt.Sprintf("failed to build dynamic client, got err: %s", err))
 	}
 
 	// Get GroupMappings for K8s API resources.
@@ -114,14 +87,10 @@ func main() {
 	if err != nil {
 		exitWithError(fmt.Sprintf("failed to get API group resources, got err: %s", err))
 	}
-
+	// Create mappings from the GroupResource to the REST API.
 	mapper := restmapper.NewDiscoveryRESTMapper(gr)
-	_, err = mapper.RESTMapping(gk)
-	if err != nil {
-		exitWithError(fmt.Sprintf("failed to get rest mapping, got err; %s", err))
-	}
 
-	// Create a serializer that can decode
+	// Create a serializer that can decode our YAML input.
 	decodingSerializer := serializerYaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
 
 	for _, object := range objects {
@@ -186,7 +155,8 @@ func main() {
 			}
 		}()
 
-		// Attempt to ServerSideApply the provided object.
+		// Attempt to ServerSideApply the provided object. This results
+		// in object creation if the resource does not already exist.
 		k8sObj, err := applyObjects(dr, obj, data)
 		if err != nil {
 			exitWithError(fmt.Sprintf("failed to apply obj, got err: %s", err))
@@ -228,6 +198,8 @@ func main() {
 	}
 }
 
+// buildConfig creates a kubernetes client config for use in buildilng
+// kubernetes clients.
 func buildConfig() (*rest.Config, error) {
 	kubeconfigPath := os.Getenv("KUBECONFIG")
 	if kubeconfigPath == "" {
@@ -242,6 +214,7 @@ func buildConfig() (*rest.Config, error) {
 	return config, nil
 }
 
+// typedClientInit creates a typed kubernetes client.
 func typedClientInit(config *rest.Config) (*kubernetes.Clientset, error) {
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -251,6 +224,7 @@ func typedClientInit(config *rest.Config) (*kubernetes.Clientset, error) {
 	return client, nil
 }
 
+// dynamicClientInit creates a dynamic kubernetes client.
 func dynamicClientInit(config *rest.Config) (dynamic.Interface, error) {
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
@@ -280,6 +254,7 @@ func buildK8sClients() (*kubernetes.Clientset, dynamic.Interface, error) {
 	return client, dynamicClient, nil
 }
 
+// getRESTMapping returns a dynamic client with the REST API mapping for a specific resource.
 func getRESTMapping(dynamicClient dynamic.Interface, name meta.RESTScopeName, namespace string, resource schema.GroupVersionResource) dynamic.ResourceInterface {
 	var dr dynamic.ResourceInterface
 	if name == meta.RESTScopeNameNamespace {
@@ -291,6 +266,8 @@ func getRESTMapping(dynamicClient dynamic.Interface, name meta.RESTScopeName, na
 	return dr
 }
 
+// decodeInput accepts a []bytes containing YAML or JSON and decodes it to a
+// common runtime object.
 func decodeInput(fileContents []byte) ([]*runtime.RawExtension, error) {
 	y := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(fileContents), 4096)
 	objects := []*runtime.RawExtension{}
@@ -309,14 +286,17 @@ func decodeInput(fileContents []byte) ([]*runtime.RawExtension, error) {
 	}
 }
 
+// decodeRawObjects returns a runtime object, and the GVK for that object.
 func decodeRawObjects(decoder runtime.Serializer, data []byte, into *unstructured.Unstructured) (runtime.Object, *schema.GroupVersionKind, error) {
 	return decoder.Decode(data, nil, into)
 }
 
+// getResourceMapping returns the resource that maps to a GroupKind.
 func getResourceMapping(mapper meta.RESTMapper, gvk *schema.GroupVersionKind) (*meta.RESTMapping, error) {
 	return mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 }
 
+// marshallRuntimeObj marhsalls a runtime.Object in a JSON []bytes.
 func marshallRuntimeObj(obj runtime.Object) ([]byte, error) {
 	data, err := json.Marshal(obj)
 	if err != nil {
@@ -326,6 +306,7 @@ func marshallRuntimeObj(obj runtime.Object) ([]byte, error) {
 	return data, nil
 }
 
+// applyObjects uses the apply patch type to create or update a resource.
 func applyObjects(dr dynamic.ResourceInterface, obj *unstructured.Unstructured, data []byte) (*unstructured.Unstructured, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
@@ -371,6 +352,7 @@ func updateReplicas(dr dynamic.ResourceInterface, k8sObj *unstructured.Unstructu
 	return k8sObj, nil
 }
 
+// getReplicas returns the number of replicas specified in a SeldonDeployment .spec.predictors[0].replicas field.
 func getReplicas(k8sObj *unstructured.Unstructured) (int64, error) {
 	// Get predictors field.
 	// Predictors is a []map[string]interface{} so we have to do a little magic to access the replicas field.
@@ -388,11 +370,13 @@ func getReplicas(k8sObj *unstructured.Unstructured) (int64, error) {
 	return replicas, nil
 }
 
+// exitWithError prints a message and exits 1.
 func exitWithError(message string) {
 	fmt.Print(message)
 	os.Exit(1)
 }
 
+// waitForDeploymentReady waits until a deployment has an equal number of desired and ready replicas.
 func waitForDeploymentReady(client kubernetes.Interface, namespace string) (*v1.Deployment, error) {
 	start := time.Now()
 	deadline := time.Now().Add(pollTimeout)
